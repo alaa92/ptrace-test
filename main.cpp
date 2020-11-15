@@ -295,15 +295,20 @@ void* protect_memory(pid_t pid, void* src, size_t size, int protection)
 void test_ptrace(pid_t pid)
 {
     int status;
-    struct user_regs_struct regs;
+    struct user_regs_struct old_regs, regs;
     unsigned char inj_buf[] =
     {
-        0xCD, 0x80,               //int80 (syscall)
-        0xCC,                     //int3  (SIGTRAP)
+        0x51,       //push ecx
+        0x53,       //push ebx
+        0xFF, 0xD0, //call eax
+        0xCC,       //int3 (SIGTRAP)
     };
 
-    void* inj_addr = allocate_memory(pid, sizeof(inj_buf), PROT_EXEC | PROT_READ | PROT_WRITE);
+    const char lib_path[] = "/home/rdbo/Documents/Codes/C/ptrace-test/libtest.so";
+    void* inj_addr = allocate_memory(pid, sizeof(inj_buf) + sizeof(lib_path), PROT_EXEC | PROT_READ | PROT_WRITE);
+    void* path_addr = (void*)((uintptr_t)inj_addr + sizeof(inj_buf));
     write_memory(pid, inj_addr, inj_buf, sizeof(inj_buf));
+    write_memory(pid, path_addr, (void*)lib_path, sizeof(lib_path));
 
     std::cout << "--ptrace test started--" << std::endl;
 
@@ -323,8 +328,11 @@ void test_ptrace(pid_t pid)
         return;
     }
 
-    regs.eax = __NR_exit;
-    regs.ebx = 222;
+    old_regs = regs;
+
+    regs.eax = 0xf7c28700;
+    regs.ebx = (long)path_addr;
+    regs.ecx = RTLD_LAZY;
     regs.eip = (unsigned long)inj_addr;
 
     if(ptrace(PTRACE_SETREGS, pid, NULL, &regs) == -1)
@@ -334,6 +342,10 @@ void test_ptrace(pid_t pid)
         return;
     }
 
+    ptrace(PTRACE_CONT, pid, NULL, NULL);
+    waitpid(pid, &status, WSTOPPED);
+    ptrace(PTRACE_SETREGS, pid, NULL, &old_regs);
+
     if(ptrace(PTRACE_DETACH, pid, NULL, NULL) == -1)
     {
         perror("PTRACE_DETACH");
@@ -341,16 +353,15 @@ void test_ptrace(pid_t pid)
         return;
     }
 
+    deallocate_memory(pid, inj_addr, sizeof(inj_buf) + sizeof(lib_path));
+
     std::cout << "--ptrace test ended--" << std::endl;
 }
 
-void* load_library(pid_t pid, std::string path, int mode)
+void load_library(pid_t pid, std::string lib_path)
 {
     int status;
     struct user_regs_struct old_regs, regs;
-    void* dlopen_ex = (void*)0xf7c29700;
-    void* handle_ex = (void*)-1;
-
     unsigned char inj_buf[] =
     {
         0x51,       //push ecx
@@ -359,70 +370,68 @@ void* load_library(pid_t pid, std::string path, int mode)
         0xCC,       //int3 (SIGTRAP)
     };
 
-    size_t path_size = path.size();
-    size_t inj_size  = sizeof(inj_buf) + path_size;
-    void*  inj_addr  = allocate_memory(pid, inj_size, PROT_EXEC | PROT_READ | PROT_WRITE);
-    void*  path_addr = (void*)((uintptr_t)inj_addr + sizeof(inj_buf));
-    write_memory(pid, inj_addr, (void*)inj_buf, sizeof(inj_buf));
-    write_memory(pid, path_addr, (void*)path.c_str(), path_size);
+    size_t inj_size = sizeof(inj_buf) + lib_path.size();
+    void* inj_addr = allocate_memory(pid, inj_size, PROT_EXEC | PROT_READ | PROT_WRITE);
+    void* path_addr = (void*)((uintptr_t)inj_addr + sizeof(inj_buf));
+    write_memory(pid, inj_addr, inj_buf, sizeof(inj_buf));
+    write_memory(pid, path_addr, (void*)lib_path.c_str(), lib_path.size());
 
-    ptrace(PTRACE_ATTACH, pid, NULL, NULL);
+    std::cout << "--ptrace test started--" << std::endl;
+
+    if(ptrace(PTRACE_ATTACH, pid, NULL, NULL) == -1)
+    {
+        perror("PTRACE_ATTACH");
+        std::cout << "Errno: " << errno << std::endl;
+        return;
+    }
+
     wait(&status);
-    ptrace(PTRACE_GETREGS, pid, NULL, &old_regs);
 
-    regs.eax = (unsigned long)dlopen_ex;
-    regs.ebx = (unsigned long)path_addr;
-    regs.ecx = (unsigned long)mode;
+    if(ptrace(PTRACE_GETREGS, pid, NULL, &old_regs) == -1)
+    {
+        perror("PTRACE_GETREGS");
+        std::cout << "Errno: " << errno << std::endl;
+        return;
+    }
+
+    regs = old_regs;
+
+    long dlopen_ex = 0xf7c28700;
+
+    regs.eax = dlopen_ex;
+    regs.ebx = (long)path_addr;
+    regs.ecx = RTLD_LAZY;
     regs.eip = (unsigned long)inj_addr;
 
     if(ptrace(PTRACE_SETREGS, pid, NULL, &regs) == -1)
     {
-        perror("PTRACE_ATTACH");
-        std::cout << "Errno: " << errno << std::endl;
-        return handle_ex;
-    }
-    
-    if(ptrace(PTRACE_CONT, pid, NULL, NULL) == -1)
-    {
-        perror("PTRACE_CONT");
-        std::cout << "Errno: " << errno << std::endl;
-        return handle_ex;
-    }
-
-    waitpid(pid, &status, WSTOPPED);
-    if(ptrace(PTRACE_GETREGS, pid, NULL, &regs) == -1)
-    {
-        perror("PTRACE_GETREGS");
-        std::cout << "Errno: " << errno << std::endl;
-        return handle_ex;
-    }
-
-    handle_ex = (void*)old_regs.eax;
-
-    if(ptrace(PTRACE_SETREGS, pid, NULL, &old_regs) == -1)
-    {
         perror("PTRACE_SETREGS");
         std::cout << "Errno: " << errno << std::endl;
-        return handle_ex;
+        return;
     }
+
+    ptrace(PTRACE_CONT, pid, NULL, NULL);
+    waitpid(pid, &status, WSTOPPED);
+    ptrace(PTRACE_SETREGS, pid, NULL, &old_regs);
 
     if(ptrace(PTRACE_DETACH, pid, NULL, NULL) == -1)
     {
         perror("PTRACE_DETACH");
         std::cout << "Errno: " << errno << std::endl;
-        return handle_ex;
+        return;
     }
 
     deallocate_memory(pid, inj_addr, inj_size);
 
-    return handle_ex;
+    std::cout << "--ptrace test ended--" << std::endl;
 }
 
 int main()
 {
     pid_t pid = get_process_id("target");
     std::cout << "PID: " << pid << std::endl;
+
     std::string lib_path = "/home/rdbo/Documents/Codes/C/ptrace-test/libtest.so";
-    load_library(pid, lib_path, RTLD_LAZY);
+    load_library(pid, lib_path);
     return 0;
 }
