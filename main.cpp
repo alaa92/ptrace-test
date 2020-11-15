@@ -32,6 +32,16 @@
 #define strtoptr(nptr, endptr, base) strtoull(nptr, endptr, base)
 #endif
 
+typedef struct _module_t
+{
+    std::string name;
+    std::string path;
+    void*       base;
+    void*       end;
+    uintptr_t   size;
+    void*       handle; //this will not be used for now, only internally with dlopen
+}module_t;
+
 pid_t get_process_id(std::string process_name)
 {
     pid_t pid = (pid_t)-1;
@@ -292,6 +302,7 @@ void* protect_memory(pid_t pid, void* src, size_t size, int protection)
     return inject_syscall(pid, __NR_mprotect, src, (void*)size, (void*)(uintptr_t)protection, NULL, NULL, NULL);
 }
 
+/*
 void test_ptrace(pid_t pid)
 {
     int status;
@@ -357,73 +368,210 @@ void test_ptrace(pid_t pid)
 
     std::cout << "--ptrace test ended--" << std::endl;
 }
+*/
+
+module_t get_module(pid_t pid, std::string module_name)
+{
+    module_t mod;
+
+    std::stringstream maps_file_path;
+    maps_file_path << "/proc/" << pid << "/maps"; //Get maps file path
+    std::cout << "Maps file path: " << maps_file_path.str() << std::endl;
+
+    std::ifstream maps_file_fs(maps_file_path.str(), std::ios::binary); //Open maps file stream
+    if(!maps_file_fs.is_open()) return mod;
+
+    std::stringstream maps_file;
+    maps_file << maps_file_fs.rdbuf(); //Read the content of the maps file
+
+    //--- Module Path
+
+    size_t module_path_pos = 0;
+    size_t module_path_end = 0;
+    std::string module_path_str;
+
+    //Get the first slash in the line of the module name
+    module_path_pos = maps_file.str().find(module_name);
+    size_t holder = module_path_pos;
+    module_path_pos = maps_file.str().rfind('\n', module_path_pos);
+    if(module_path_pos == maps_file.str().npos) //If it's invalid, try another method
+        module_path_pos = maps_file.str().rfind("08:01", holder); //The 'dev' of every module is '08:01', so we can use it as a filter
+    module_path_pos = maps_file.str().find('/', module_path_pos);
+
+    //Get the end of the line of the module name
+    module_path_end = maps_file.str().find('\n', module_path_pos);
+
+    if(module_path_pos == maps_file.str().npos || module_path_end == maps_file.str().npos) return mod;
+
+    //Module path substring
+    module_path_str = maps_file.str().substr(module_path_pos, module_path_end - module_path_pos);
+
+    std::cout << "Module path string: " << module_path_str << std::endl;
+
+    //--- Module name
+
+    std::string module_name_str = module_path_str.substr(
+        module_path_str.rfind('/') + 1 //Substring from the last '/' to the end of the string
+    );
+
+    std::cout << "Module name: " << module_name_str << std::endl;
+
+    //--- Base Address
+
+    size_t base_address_pos = maps_file.str().rfind('\n', module_path_pos) + 1;
+    size_t base_address_end = maps_file.str().find('-', base_address_pos);
+    if(base_address_pos == maps_file.str().npos || base_address_end == maps_file.str().npos) return mod;
+    std::string base_address_str = maps_file.str().substr(base_address_pos, base_address_end - base_address_pos);
+    base_address_str += '\0'; //Making sure the null terminator is there
+    void* base_address = (void*)strtoptr(base_address_str.c_str(), NULL, 16);
+    std::cout << "Base Address: " << base_address << std::endl;
+
+    //--- End Address
+    size_t end_address_pos;
+    size_t end_address_end;
+    std::string end_address_str;
+    void* end_address;
+
+    //Get end address pos
+    end_address_pos = maps_file.str().rfind(module_path_str);
+    end_address_pos = maps_file.str().rfind('\n', end_address_pos) + 1;
+    end_address_pos = maps_file.str().find('-', end_address_pos) + 1;
+
+    //Find first space from end_address_pos
+    end_address_end = maps_file.str().find(' ', end_address_pos);
+
+    if(end_address_pos == maps_file.str().npos || end_address_end == maps_file.str().npos) return mod;
+
+    //End address substring
+    end_address_str = maps_file.str().substr(end_address_pos, end_address_end - end_address_pos);
+    end_address_str += '\0';
+    end_address = (void*)strtoptr(end_address_str.c_str(), NULL, 16);
+
+    std::cout << "End Address: " << end_address << std::endl;
+
+    //--- Module size
+
+    uintptr_t module_size = (uintptr_t)end_address - (uintptr_t)base_address;
+    std::cout << "Module Size: " << (void*)module_size << std::endl;
+
+    //---
+
+    //Now we put all the information we got into the mod structure
+
+    mod.name = module_name_str;
+    mod.path = module_path_str;
+    mod.base = base_address;
+    mod.size = module_size;
+    mod.end  = end_address;
+
+    maps_file_fs.close();
+
+    return mod;
+}
 
 void load_library(pid_t pid, std::string lib_path)
 {
+    /* Let's get the address of the 'libc_dlopen_mode' of the target process
+     * and store it on 'dlopen_ex' by loading the LIBC of the target process
+     * on here and then getting the offset of its own '__libc_dlopen_mode'.
+     * Then we sum this offset to the base of the external LIBC module
+     */
+
+    module_t libc_ex = get_module(pid, "/libc");
+
+    //Load the external libc on this process
+    void* libc_handle = dlopen(libc_ex.path.c_str(), RTLD_LAZY);
+
+    //Get the symbol '__libc_dlopen_mode' from the loaded LIBC module
+    void* dlopen_in = dlsym(libc_handle, "__libc_dlopen_mode");
+
+    //Get the loaded libc module information and store it on libc_in
+    module_t libc_in = get_module(getpid(), "/libc");
+
+    //Get the offset by subtracting 'libc_in.base' from 'dlopen_in'
+    uintptr_t offset = (uintptr_t)dlopen_in - (uintptr_t)libc_in.base;
+
+    //Get the external '__libc_dlopen_mode' by summing the offset to the libc_ex.base
+    
+    void* dlopen_ex = (void*)((uintptr_t)libc_ex.base + offset);
+
+    //--- Now let's go to the injection part
+
     int status;
     struct user_regs_struct old_regs, regs;
     unsigned char inj_buf[] =
     {
+#       if defined(ARCH_86)
+        /* We have to pass the parameters to the stack (in reversed order)
+         * The register 'ebx' will store the library path address and the
+         * register 'ecx' will store the flag (RTLD_LAZY)
+         * After pushing the parameters to the stack, we will call EAX, which
+         * will store the address of '__libc_dlopen_mode'
+         */
         0x51,       //push ecx
         0x53,       //push ebx
         0xFF, 0xD0, //call eax
         0xCC,       //int3 (SIGTRAP)
+#       elif defined(ARCH_64)
+        /* On 'x64', we dont have to pass anything to the stack, as we're only
+         * using 2 parameters, which will be stored on RDI (library path address) and
+         * RSI (flags, in this case RTLD_LAZY).
+         * This means we just have to call the __libc_dlopen_mode function, which 
+         * will be on RAX.
+         */
+
+        0xFF, 0xD0, //call rax
+        0xCC,       //int3 (SIGTRAP)
+#       endif
     };
 
+    //Let's allocate memory for the payload and the library path
     size_t inj_size = sizeof(inj_buf) + lib_path.size();
     void* inj_addr = allocate_memory(pid, inj_size, PROT_EXEC | PROT_READ | PROT_WRITE);
     void* path_addr = (void*)((uintptr_t)inj_addr + sizeof(inj_buf));
+
+    //Write the memory to our allocated address
     write_memory(pid, inj_addr, inj_buf, sizeof(inj_buf));
     write_memory(pid, path_addr, (void*)lib_path.c_str(), lib_path.size());
 
-    std::cout << "--ptrace test started--" << std::endl;
-
-    if(ptrace(PTRACE_ATTACH, pid, NULL, NULL) == -1)
-    {
-        perror("PTRACE_ATTACH");
-        std::cout << "Errno: " << errno << std::endl;
-        return;
-    }
-
+    //Attach to the target process
+    ptrace(PTRACE_ATTACH, pid, NULL, NULL);
     wait(&status);
 
-    if(ptrace(PTRACE_GETREGS, pid, NULL, &old_regs) == -1)
-    {
-        perror("PTRACE_GETREGS");
-        std::cout << "Errno: " << errno << std::endl;
-        return;
-    }
-
+    //Get the current registers to restore later
+    ptrace(PTRACE_GETREGS, pid, NULL, &old_regs);
     regs = old_regs;
 
-    long dlopen_ex = 0xf7c28700;
-
-    regs.eax = dlopen_ex;
+    //Let's setup the registers according to our payload
+#   if defined(ARCH_86)
+    regs.eax = (long)dlopen_ex;
     regs.ebx = (long)path_addr;
-    regs.ecx = RTLD_LAZY;
-    regs.eip = (unsigned long)inj_addr;
+    regs.ecx = (long)RTLD_LAZY;
+    regs.eip = (long)inj_addr; //The execution will continue from 'inj_addr' (EIP)
+#   elif defined(ARCH_64)
+    regs.rax = (uintptr_t)dlopen_ex;
+    regs.rdi = (uintptr_t)path_addr;
+    regs.rsi = (uintptr_t)RTLD_LAZY;
+    regs.rip = (uintptr_t)inj_addr; //The execution will continue from 'inj_addr' (RIP)
+#   endif
 
-    if(ptrace(PTRACE_SETREGS, pid, NULL, &regs) == -1)
-    {
-        perror("PTRACE_SETREGS");
-        std::cout << "Errno: " << errno << std::endl;
-        return;
-    }
+    //Inject the modified registers to the target process
+    ptrace(PTRACE_SETREGS, pid, NULL, &regs);
 
+    //Continue the execution
     ptrace(PTRACE_CONT, pid, NULL, NULL);
+
+    //Wait for the int3 (SIGTRAP) breakpoint
     waitpid(pid, &status, WSTOPPED);
+
+    //Set back the old registers
     ptrace(PTRACE_SETREGS, pid, NULL, &old_regs);
 
-    if(ptrace(PTRACE_DETACH, pid, NULL, NULL) == -1)
-    {
-        perror("PTRACE_DETACH");
-        std::cout << "Errno: " << errno << std::endl;
-        return;
-    }
+    //Detach from the process and continue the execution
+    ptrace(PTRACE_DETACH, pid, NULL, NULL);
 
+    //Deallocate the memory we allocated for the injection buffer and the library path
     deallocate_memory(pid, inj_addr, inj_size);
-
-    std::cout << "--ptrace test ended--" << std::endl;
 }
 
 int main()
